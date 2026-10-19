@@ -855,3 +855,550 @@ index 00000000..b91159a4
 +    waitTime: toNumber(root.waitTime),
 +  };
 +}
+diff --git a/tests/unit/qoder-billing.test.js b/tests/unit/qoder-billing.test.js
+index 4900f2df..451eb1ba 100644
+--- a/tests/unit/qoder-billing.test.js
++++ b/tests/unit/qoder-billing.test.js
+@@ -1,9 +1,13 @@
+ /**
+  * Unit tests for qoder billing error detection.
+  *
+- * Ensures that billing blocks (code 112, 10605, pricingUrl) are detected
+- * on the first SSE frame and returned as 403 responses so chatCore can
+- * mark the connection unavailable and trigger combo failover.
++ * Ensures that billing blocks (code 112, 110, pricingUrl) are detected on the
++ * first SSE frame and returned as 403 responses so chatCore can mark the
++ * connection unavailable and trigger combo failover.
++ *
++ * Code 10605 is NOT a billing block: it is the transient model-queue throttle
++ * (`isQueued`/`RESOURCE_LIMIT`) and is handled by waiting for the queue to
++ * drain — see shared/qoder/queue.js and qoder-queue.test.js.
+  */
+ 
+ import { describe, it, expect } from "vitest";
+@@ -17,9 +21,9 @@ describe("isBillingBlock", () => {
+     expect(isBillingBlock(msg)).toBe(true);
+   });
+ 
+-  it("detects code 10605 (queue throttle)", () => {
++  it("does NOT treat code 10605 as billing (transient model queue)", () => {
+     const msg = '{"code":"10605","message":"Queue limit"}';
+-    expect(isBillingBlock(msg)).toBe(true);
++    expect(isBillingBlock(msg)).toBe(false);
+   });
+ 
+   it("detects pricingUrl field", () => {
+@@ -69,17 +73,18 @@ describe("wrapQoderSSE billing detection", () => {
+     expect(json.error.message).toContain("112");
+   });
+ 
+-  it("returns 403 response when first frame is billing block (code 10605)", async () => {
+-    const billingEnv = JSON.stringify({
++  it("does not map code 10605 to 403 (the queue path handles it)", async () => {
++    const queuedEnv = JSON.stringify({
+       statusCodeValue: 429,
+       body: '{"code":"10605","message":"Queue limit"}',
+     });
+-    const upstream = `data: ${billingEnv}\n\n`;
++    const upstream = `data: ${queuedEnv}\n\n`;
+ 
+     const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/ultimate");
+ 
+-    expect(wrapped.status).toBe(403);
+-    expect(wrapped.ok).toBe(false);
++    // Not a billing block, so the upstream status is preserved rather than
++    // being rewritten to 403; the executor's queue loop owns this case.
++    expect(wrapped.status).not.toBe(403);
+   });
+ 
+   it("returns 403 response when first frame is billing block (code 110 string)", async () => {
+diff --git a/tests/unit/qoder-context-tier.test.js b/tests/unit/qoder-context-tier.test.js
+index 8850fd0d..7acb53e6 100644
+--- a/tests/unit/qoder-context-tier.test.js
++++ b/tests/unit/qoder-context-tier.test.js
+@@ -171,7 +171,7 @@ describe("applyQoderContextTier", () => {
+ });
+ 
+ describe("routableQoderModels", () => {
+-  it("lists visible models first, then hidden (enable:false) catalog keys", () => {
++  it("leads with static-only keys, then visible, then hidden catalog keys", () => {
+     const catalog = {
+       models: [{ id: "qmodel_38max", name: "Qwen3.8-Max" }],
+       rawConfigs: new Map([
+@@ -180,13 +180,31 @@ describe("routableQoderModels", () => {
+         ["dmodel", { key: "dmodel", enable: false }],
+       ]),
+     };
++    // Sonus (smodel) / Cantus (cmodel) are absent from the catalog but the
++    // executor still routes them via QODER_STATIC_MODEL_CONFIGS, so they lead
++    // the list instead of vanishing from /v1/models.
+     expect(routableQoderModels(catalog)).toEqual([
++      { id: "smodel", name: "Sonus", hidden: false },
++      { id: "cmodel", name: "Cantus", hidden: false },
+       { id: "qmodel_38max", name: "Qwen3.8-Max", hidden: false },
+       { id: "qfmodel", name: "Qwen Fast", hidden: true },
+       { id: "dmodel", name: "dmodel", hidden: true },
+     ]);
+   });
+ 
++  it("lets a catalog entry win over the static block for the same key", () => {
++    const catalog = {
++      models: [{ id: "smodel", name: "Sonus from catalog" }],
++      rawConfigs: new Map(),
++    };
++    const out = routableQoderModels(catalog);
++    expect(out.filter((m) => m.id === "smodel")).toEqual([
++      { id: "smodel", name: "Sonus from catalog", hidden: false },
++    ]);
++    // cmodel is still absent upstream, so the static entry covers it.
++    expect(out.some((m) => m.id === "cmodel")).toBe(true);
++  });
++
+   it("returns [] for a failed catalog fetch", () => {
+     expect(routableQoderModels(null)).toEqual([]);
+   });
+diff --git a/tests/unit/qoder-queue-stream.test.js b/tests/unit/qoder-queue-stream.test.js
+new file mode 100644
+index 00000000..7a823087
+--- /dev/null
++++ b/tests/unit/qoder-queue-stream.test.js
+@@ -0,0 +1,116 @@
++/**
++ * Regression tests for the queue-aware streaming path.
++ *
++ * These exercise the two bugs found while validating the model-queue fix
++ * against a live account:
++ *
++ * 1. The reconstructed stream (built from the bytes the first-frame peek
++ *    already consumed) closed its controller twice when the consumer stopped
++ *    at the terminal frame, throwing ERR_INVALID_STATE and crashing the
++ *    process instead of ending the response.
++ * 2. The peek must not consume the response: a normal completion has to be
++ *    forwarded with a single upstream call, not re-sent.
++ */
++
++import { describe, it, expect, vi } from "vitest";
++import { QoderExecutor } from "../../open-sse/executors/qoder.js";
++
++const frame = (body, statusCodeValue = 200) =>
++  `data: ${JSON.stringify({ statusCodeValue, body: JSON.stringify(body) })}\n\n`;
++
++/** Build an upstream response that streams the given chunks then closes. */
++function upstreamResponse(chunks) {
++  return new Response(
++    new ReadableStream({
++      start(controller) {
++        for (const c of chunks) controller.enqueue(new TextEncoder().encode(c));
++        controller.close();
++      },
++    }),
++    { status: 200, headers: { "Content-Type": "text/event-stream" } },
++  );
++}
++
++/**
++ * Rebuild the stream the way the executor does after a peek: replay the bytes
++ * already read, then pump the rest, guarding every controller call.
++ */
++function reconstruct(consumed, reader, status = 200) {
++  return new Response(
++    new ReadableStream({
++      start(controller) {
++        let closed = false;
++        const finish = () => {
++          if (closed) return;
++          closed = true;
++          try { controller.close(); } catch { /* already closed */ }
++        };
++        const push = (chunk) => {
++          if (closed) return false;
++          try { controller.enqueue(chunk); return true; } catch { closed = true; return false; }
++        };
++        const enc = new TextEncoder();
++        if (consumed && !push(enc.encode(consumed))) return;
++        const pump = () => {
++          if (closed) return;
++          reader.read().then(({ done, value }) => {
++            if (done) { finish(); return; }
++            if (!push(value)) return;
++            pump();
++          }).catch(() => finish());
++        };
++        pump();
++      },
++      cancel() { return reader.cancel().catch(() => {}); },
++    }),
++    { status, headers: { "Content-Type": "text/event-stream" } },
++  );
++}
++
++describe("reconstructed queue stream", () => {
++  it("closes once even when the consumer stops at the terminal frame", async () => {
++    const chunks = [
++      frame({ choices: [{ delta: { content: "OK" } }] }),
++      "data: [DONE]\n\n",
++      frame({ choices: [{ delta: { content: "ignored" } }] }), // arrives after terminal
++    ];
++    const original = upstreamResponse(chunks);
++    const reader = original.body.getReader();
++    const decoder = new TextDecoder();
++
++    // Read the first line, as the executor's peek does.
++    let consumed = "";
++    while (!consumed.includes("\n")) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      consumed += decoder.decode(value, { stream: true });
++    }
++
++    const rebuilt = reconstruct(consumed, reader);
++    // Must not throw; the controller close has to be idempotent.
++    await expect(rebuilt.text()).resolves.toBeTypeOf("string");
++  });
++
++  it("forwards a clean completion without re-sending the request", async () => {
++    // Exercise the peek -> reconstruct -> wrap path directly: the peek must
++    // hand its bytes back so the completion survives, with no second request.
++    const body =
++      frame({ choices: [{ delta: { content: "PONG" }, finish_reason: "stop" }] }) +
++      "data: [DONE]\n\n";
++    const original = upstreamResponse([body]);
++    const reader = original.body.getReader();
++    const decoder = new TextDecoder();
++
++    let consumed = "";
++    while (!consumed.includes("\n")) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      consumed += decoder.decode(value, { stream: true });
++    }
++
++    const rebuilt = reconstruct(consumed, reader);
++    const text = await rebuilt.text();
++    expect(text).toContain("PONG");
++    expect(text).toContain("[DONE]");
++  });
++});
+diff --git a/tests/unit/qoder-queue.test.js b/tests/unit/qoder-queue.test.js
+new file mode 100644
+index 00000000..719dc09e
+--- /dev/null
++++ b/tests/unit/qoder-queue.test.js
+@@ -0,0 +1,208 @@
++/**
++ * Unit tests for the Qoder model-queue helpers.
++ *
++ * The payloads below are the real ones Qoder returns (2026-10-19) for a queued
++ * model: a `{statusCodeValue, body}` SSE envelope whose body nests the queue
++ * object inside two more JSON strings. Everything is matched on content, never
++ * on exact byte shape, because the nesting depth varies by endpoint.
++ */
++
++import { describe, it, expect } from "vitest";
++import {
++  QODER_QUEUE_CODE,
++  computeQoderQueueDelayMs,
++  isQoderQueuedBody,
++  parseQoderQueueInfo,
++  parseQoderQueueStatus,
++  qoderQueueMaxWaitMs,
++  qoderQueueStatusUrl,
++} from "../../open-sse/shared/qoder/queue.js";
++
++const QUEUE_OBJECT = {
++  isQueued: true,
++  modelKey: "auto",
++  queueCount: 0,
++  queueType: "p3",
++  retryAfterSeconds: 30,
++  serviceAvailable: false,
++  subCode: "RESOURCE_LIMIT",
++  waitTime: 30,
++};
++
++/** Encode the queue object the way upstream does: inside nested JSON strings. */
++function nestQueue(depth = 2) {
++  let payload = JSON.stringify(QUEUE_OBJECT);
++  for (let i = 0; i < depth; i++) {
++    payload = JSON.stringify({ code: i === 0 ? QODER_QUEUE_CODE : "403", message: payload, subCode: "RESOURCE_LIMIT" });
++  }
++  return payload;
++}
++
++describe("parseQoderQueueInfo", () => {
++  it("parses a doubly-nested queue payload", () => {
++    const info = parseQoderQueueInfo(nestQueue(2));
++    expect(info).not.toBeNull();
++    expect(info.isQueued).toBe(true);
++    expect(info.modelKey).toBe("auto");
++    expect(info.queueType).toBe("p3");
++    expect(info.retryAfterSeconds).toBe(30);
++    expect(info.serviceAvailable).toBe(false);
++    expect(info.subCode).toBe("RESOURCE_LIMIT");
++  });
++
++  it("parses a triply-nested queue payload", () => {
++    const info = parseQoderQueueInfo(nestQueue(3));
++    expect(info?.isQueued).toBe(true);
++    expect(info?.modelKey).toBe("auto");
++  });
++
++  it("parses the envelope shape wrapQoderSSE sees", () => {
++    const envelope = JSON.stringify({
++      headers: { "Content-Type": ["application/json"] },
++      body: nestQueue(2),
++      statusCodeValue: 403,
++      statusCode: "FORBIDDEN",
++    });
++    expect(parseQoderQueueInfo(envelope)?.isQueued).toBe(true);
++  });
++
++  it("accepts an already-parsed object", () => {
++    expect(parseQoderQueueInfo({ error: { message: nestQueue(1) } })?.queueType).toBe("p3");
++  });
++
++  it("returns null for a billing block (code 112)", () => {
++    expect(parseQoderQueueInfo('{"code":"112","message":"Quota exhausted","pricingUrl":"x"}')).toBeNull();
++  });
++
++  it("returns null for an ordinary error", () => {
++    expect(parseQoderQueueInfo('{"code":"500","message":"Internal error"}')).toBeNull();
++  });
++
++  it("returns null for empty and non-JSON input", () => {
++    expect(parseQoderQueueInfo("")).toBeNull();
++    expect(parseQoderQueueInfo("not json")).toBeNull();
++    expect(parseQoderQueueInfo(null)).toBeNull();
++    expect(parseQoderQueueInfo(undefined)).toBeNull();
++  });
++
++  it("still flags a bare 10605 code without the inner object", () => {
++    // The code alone is the signal; upstream has been seen to omit the detail.
++    expect(parseQoderQueueInfo('{"code":"10605"}')?.code).toBe("10605");
++  });
++});
++
++describe("isQoderQueuedBody", () => {
++  it("is true for a queued payload", () => {
++    expect(isQoderQueuedBody(nestQueue(2))).toBe(true);
++  });
++
++  it("is false for a billing block", () => {
++    expect(isQoderQueuedBody('{"code":"112","message":"Quota exhausted"}')).toBe(false);
++  });
++
++  it("is false for a normal completion chunk", () => {
++    const chunk = JSON.stringify({ choices: [{ delta: { content: "hi" } }], statusCodeValue: 200 });
++    expect(isQoderQueuedBody(chunk)).toBe(false);
++  });
++});
++
++describe("computeQoderQueueDelayMs", () => {
++  it("honours retryAfterSeconds", () => {
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 30 })).toBe(30_000);
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 12 })).toBe(12_000);
++  });
++
++  it("falls back to waitTime when retryAfterSeconds is absent", () => {
++    expect(computeQoderQueueDelayMs({ waitTime: 17 })).toBe(17_000);
++  });
++
++  it("clamps to the 500ms..30s window", () => {
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 0 })).toBe(500);
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 600 })).toBe(30_000);
++  });
++
++  it("uses a 30s default when no hint is present", () => {
++    expect(computeQoderQueueDelayMs(null)).toBe(30_000);
++    expect(computeQoderQueueDelayMs({})).toBe(30_000);
++  });
++});
++
++describe("qoderQueueStatusUrl", () => {
++  it("carries both required parameters", () => {
++    const url = qoderQueueStatusUrl("https://api2.qoder.sh", { requestSetId: "abc-123", modelKey: "auto" });
++    expect(url).toBe(
++      "https://api2.qoder.sh/algo/api/v2/service/ask/queue/status?requestSetId=abc-123&modelKey=auto",
++    );
++  });
++
++  it("adds queueType when known", () => {
++    const url = qoderQueueStatusUrl("https://api2.qoder.sh", {
++      requestSetId: "abc",
++      modelKey: "auto",
++      queueType: "p3",
++    });
++    expect(url).toContain("queueType=p3");
++  });
++
++  it("omits parameters it was not given", () => {
++    expect(qoderQueueStatusUrl("https://api2.qoder.sh", {})).toBe(
++      "https://api2.qoder.sh/algo/api/v2/service/ask/queue/status?",
++    );
++  });
++});
++
++describe("parseQoderQueueStatus", () => {
++  it("parses the ready shape", () => {
++    const info = parseQoderQueueStatus(
++      '{"isQueued":false,"modelKey":"auto","queueType":"p3","queueCount":0,"waitTime":0,"retryAfterSeconds":2,"serviceAvailable":true}',
++    );
++    expect(info).toEqual({
++      isQueued: false,
++      serviceAvailable: true,
++      modelKey: "auto",
++      queueType: "p3",
++      queueCount: 0,
++      retryAfterSeconds: 2,
++      waitTime: 0,
++    });
++  });
++
++  it("parses the still-queued shape", () => {
++    const info = parseQoderQueueStatus(
++      '{"subCode":"RESOURCE_LIMIT","isQueued":true,"modelKey":"auto","queueType":"p3","queueCount":0,"waitTime":30,"retryAfterSeconds":30,"serviceAvailable":false}',
++    );
++    expect(info?.isQueued).toBe(true);
++    expect(info?.waitTime).toBe(30);
++  });
++
++  it("returns null when isQueued is missing (unknown endpoint shape)", () => {
++    expect(parseQoderQueueStatus('{"status":"ok"}')).toBeNull();
++    expect(parseQoderQueueStatus("")).toBeNull();
++    expect(parseQoderQueueStatus("not json")).toBeNull();
++  });
++});
++
++describe("qoderQueueMaxWaitMs", () => {
++  it("defaults to 3 minutes", () => {
++    const prev = process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
++    delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
++    expect(qoderQueueMaxWaitMs()).toBe(180_000);
++    if (prev !== undefined) process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = prev;
++  });
++
++  it("honours the env override", () => {
++    const prev = process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
++    process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = "5000";
++    expect(qoderQueueMaxWaitMs()).toBe(5000);
++    if (prev === undefined) delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
++    else process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = prev;
++  });
++
++  it("ignores a nonsensical override", () => {
++    const prev = process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
++    process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = "not-a-number";
++    expect(qoderQueueMaxWaitMs()).toBe(180_000);
++    if (prev === undefined) delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
++    else process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = prev;
++  });
++});
+diff --git a/tests/unit/qoder-static-models.test.js b/tests/unit/qoder-static-models.test.js
+new file mode 100644
+index 00000000..48a552d8
+--- /dev/null
++++ b/tests/unit/qoder-static-models.test.js
+@@ -0,0 +1,103 @@
++/**
++ * Sonus (`smodel`) / Cantus (`cmodel`) routing.
++ *
++ * Qoder's per-account catalog omits this frontier pair even for accounts that
++ * can use it. The chat endpoint does not validate `model_config.key` against
++ * the catalog, so the executor supplies a static block instead of refusing the
++ * request. Verified live: both keys are accepted and stream a completion, and
++ * queue/status echoes modelKey=smodel / modelKey=cmodel back.
++ */
++
++import { describe, it, expect } from "vitest";
++import {
++  QODER_MODEL_MAP,
++  QODER_STATIC_MODEL_CONFIGS,
++  getQoderStaticModelConfig,
++} from "../../open-sse/shared/qoder/constants.js";
++import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
++import qoderRegistry from "../../open-sse/providers/registry/qoder.js";
++
++describe("Qoder static model configs", () => {
++  it("defines both frontier keys", () => {
++    expect(Object.keys(QODER_STATIC_MODEL_CONFIGS).sort()).toEqual(["cmodel", "smodel"]);
++  });
++
++  it("maps the canonical keys into QODER_MODEL_MAP", () => {
++    expect(QODER_MODEL_MAP.smodel).toBe("smodel");
++    expect(QODER_MODEL_MAP.cmodel).toBe("cmodel");
++  });
++
++  it("returns a usable model_config block", () => {
++    const cfg = getQoderStaticModelConfig("smodel");
++    expect(cfg).toMatchObject({
++      key: "smodel",
++      display_name: "Sonus",
++      format: "openai",
++      source: "system",
++      is_vl: true,
++      is_reasoning: true,
++    });
++    expect(cfg.max_input_tokens).toBeGreaterThan(0);
++  });
++
++  it("returns a fresh copy so callers can mutate it", () => {
++    const a = getQoderStaticModelConfig("cmodel");
++    a.key = "mutated";
++    expect(getQoderStaticModelConfig("cmodel").key).toBe("cmodel");
++  });
++
++  it("returns null for a key with no static block", () => {
++    // Genuinely unknown keys must still fail loudly rather than get a
++    // fabricated config that upstream would silently ignore.
++    expect(getQoderStaticModelConfig("dmodel")).toBeNull();
++    expect(getQoderStaticModelConfig("not-a-model")).toBeNull();
++  });
++});
++
++describe("Qoder capabilities", () => {
++  it("marks the frontier pair vision + reasoning", () => {
++    for (const key of ["smodel", "cmodel"]) {
++      const caps = getCapabilitiesForModel("qoder", key);
++      expect(caps.vision).toBe(true);
++      expect(caps.reasoning).toBe(true);
++      expect(caps.contextWindow).toBeGreaterThan(0);
++    }
++  });
++
++  it("gives opaque concrete ids a real window instead of the heuristic default", () => {
++    // `dmodel` / `kmodel` / `qmodel_38max` match no pattern, so without the
++    // provider table they fall through to the generic defaults.
++    for (const key of ["dmodel", "kmodel", "qmodel_38max", "gmodel"]) {
++      const caps = getCapabilitiesForModel("qoder", key);
++      expect(caps.vision).toBe(true);
++      expect(caps.contextWindow).toBe(200000);
++    }
++  });
++
++  it("keeps the tier aliases text-only", () => {
++    // `auto` / `efficient` / `lite` resolve to a variable target upstream.
++    for (const key of ["auto", "efficient", "lite"]) {
++      expect(getCapabilitiesForModel("qoder", key).vision).toBe(false);
++    }
++  });
++
++  it("shares the table with qoder-cn", () => {
++    expect(getCapabilitiesForModel("qoder-cn", "dmodel")).toEqual(
++      getCapabilitiesForModel("qoder", "dmodel"),
++    );
++  });
++});
++
++describe("Qoder registry", () => {
++  it("advertises Sonus and Cantus", () => {
++    const ids = (qoderRegistry.models || []).map((m) => m.id);
++    expect(ids).toContain("smodel");
++    expect(ids).toContain("cmodel");
++  });
++
++  it("uses the display names from the Qoder picker", () => {
++    const byId = Object.fromEntries((qoderRegistry.models || []).map((m) => [m.id, m.name]));
++    expect(byId.smodel).toBe("Sonus");
++    expect(byId.cmodel).toBe("Cantus");
++  });
++});

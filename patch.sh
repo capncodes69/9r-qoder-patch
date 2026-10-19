@@ -128,7 +128,13 @@ grep -q 'QODER_STATIC_MODEL_CONFIGS' open-sse/shared/qoder/constants.js \
   || die "verification failed: Sonus/Cantus static configs missing"
 grep -q 'PROVIDER_CAPABILITIES\["qoder"\] = {' open-sse/providers/capabilities.js \
   || die "verification failed: qoder capability table missing"
-ok "all three fixes present"
+# The bundle also updates the two suites that encoded the old behaviour, so a
+# half-applied patch cannot leave the tree with passing tests and broken code.
+grep -q 'does NOT treat code 10605 as billing' tests/unit/qoder-billing.test.js \
+  || die "verification failed: billing test not updated"
+[[ -f tests/unit/qoder-queue.test.js ]] \
+  || die "verification failed: queue tests missing"
+ok "all three fixes present (source + tests)"
 
 echo
 log "Done."

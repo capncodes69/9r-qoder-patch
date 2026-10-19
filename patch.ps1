@@ -127,7 +127,11 @@ try {
         @{ File = 'open-sse/executors/qoder.js';            Needle = 'qoder_model_queued';        What = 'model-queue handling' },
         @{ File = 'open-sse/shared/qoder/queue.js';         Needle = 'parseQoderQueueStatus';     What = 'queue module' },
         @{ File = 'open-sse/shared/qoder/constants.js';     Needle = 'QODER_STATIC_MODEL_CONFIGS'; What = 'Sonus/Cantus static configs' },
-        @{ File = 'open-sse/providers/capabilities.js';     Needle = 'PROVIDER_CAPABILITIES["qoder"] = {';                What = 'qoder capability table' }
+        @{ File = 'open-sse/providers/capabilities.js';     Needle = 'PROVIDER_CAPABILITIES["qoder"] = {';                What = 'qoder capability table' },
+        # The bundle also updates the two suites that encoded the old behaviour, so
+        # a half-applied patch cannot leave passing tests over broken code.
+        @{ File = 'tests/unit/qoder-billing.test.js';       Needle = 'does NOT treat code 10605 as billing'; What = 'billing test update' },
+        @{ File = 'tests/unit/qoder-queue.test.js';         Needle = 'parseQoderQueueInfo';       What = 'queue tests' }
     )
     foreach ($p in $probes) {
         if (-not (Test-Path $p.File)) { Die "verification failed: $($p.File) missing" }
@@ -135,7 +139,7 @@ try {
             Die "verification failed: $($p.What) missing from $($p.File)"
         }
     }
-    Write-Ok 'all three fixes present'
+    Write-Ok 'all three fixes present (source + tests)'
 
     Write-Host ''
     Write-Log 'Done.'
