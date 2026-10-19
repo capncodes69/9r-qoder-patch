@@ -1,10 +1,18 @@
 # 9r-qoder-patch
 
+> ### Need a Qoder account?
+>
+> **Base 400 credits** Qoder accounts — order via Telegram:
+> **[@contools_bot](https://t.me/contools_bot)**
+>
+> Third-party seller, not affiliated with this repo or with 9router. Check the
+> offer yourself before paying.
+
 Three fixes for **Qoder (`qd/*`) in 9router**.
 
 Run it from the root of your 9router repo. No install, no environment variables,
-no build step — it edits seven source files in place, and `npm run dev` /
-`npm run build` pick them up as usual.
+no build step — it edits seven source files and five test files in place, and
+`npm run dev` / `npm run build` pick them up as usual.
 
 ---
 
