@@ -144,16 +144,29 @@ text-only because they resolve to a variable target upstream.
 ## What it changes
 
 ```
-open-sse/executors/qoder.js           queue wait, billing split, stable machineId
-open-sse/shared/qoder/queue.js        NEW — queue payload parsing + status polling
-open-sse/shared/qoder/constants.js    Sonus/Cantus static model_config blocks
-open-sse/shared/qoder/cosy.js         machineId derived from userId
-open-sse/services/qoderModels.js      keep static-only keys in /v1/models
-open-sse/providers/registry/qoder.js  advertise Sonus / Cantus
-open-sse/providers/capabilities.js    restore the qoder capability table
+open-sse/executors/qoder.js             queue wait, billing split, stable machineId
+open-sse/shared/qoder/queue.js          NEW — queue payload parsing + status polling
+open-sse/shared/qoder/constants.js      Sonus/Cantus static model_config blocks
+open-sse/shared/qoder/cosy.js           machineId derived from userId
+open-sse/services/qoderModels.js        keep static-only keys in /v1/models
+open-sse/providers/registry/qoder.js    advertise Sonus / Cantus
+open-sse/providers/capabilities.js      restore the qoder capability table
+
+tests/unit/qoder-billing.test.js        UPDATED — 10605 is not a billing block
+tests/unit/qoder-context-tier.test.js   UPDATED — static keys lead the model list
+tests/unit/qoder-queue.test.js          NEW
+tests/unit/qoder-queue-stream.test.js   NEW
+tests/unit/qoder-static-models.test.js  NEW
 ```
 
-Seven files. No dependencies, no config, no data, no schema change.
+Twelve files. No dependencies, no config, no data, no schema change.
+
+**The test files are included on purpose.** Two existing suites assert the
+behaviour this patch changes — `qoder-billing` expects `10605` to be a billing
+block, `qoder-context-tier` expects the live catalog first. Shipping the source
+without them leaves those suites red, which looks like a regression when it is
+the intended fix. With them the suite matches what upstream sees on
+[#5051](https://github.com/decolua/9router/pull/5051).
 
 ## If the patch does not apply
 
