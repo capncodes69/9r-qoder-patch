@@ -1,5 +1,5 @@
 diff --git a/open-sse/executors/qoder.js b/open-sse/executors/qoder.js
-index f9e7d769..7a87b76e 100644
+index f9e7d769..66d6c555 100644
 --- a/open-sse/executors/qoder.js
 +++ b/open-sse/executors/qoder.js
 @@ -21,7 +21,6 @@
@@ -136,7 +136,7 @@ index f9e7d769..7a87b76e 100644
          },
        );
      } catch (err) {
-@@ -701,37 +753,276 @@ export class QoderExecutor extends BaseExecutor {
+@@ -701,37 +753,291 @@ export class QoderExecutor extends BaseExecutor {
        ...cosyHeaders,
      };
  
@@ -193,7 +193,9 @@ index f9e7d769..7a87b76e 100644
 +        );
 +        return { error: fakeResp, url, headers: {}, transformedBody: body };
 +      }
-+
+ 
+-    const wrapped = await wrapQoderSSE(response, `${this.provider}/${qoderKey}`, log);
+-    return { response: wrapped, url, headers, transformedBody: payload };
 +      const attemptHeadersFull = {
 +        "Content-Type": "application/json",
 +        Accept: "text/event-stream",
@@ -285,6 +287,9 @@ index f9e7d769..7a87b76e 100644
 +    const waitStartedAt = Date.now();
 +    let lastQueueInfo = null;
 +    let statusPollsEnabled = true;
++    // Guards the "status says ready" fast path: one free replay, then stop
++    // believing an endpoint that has already been contradicted.
++    let readyReplayUsed = false;
 +    // The queue is keyed by request_set_id, and qodercli keeps ONE request_id
 +    // for the whole recovery. A fresh id per replay makes the status poll look
 +    // at a queue entry nobody is waiting on, so it reports queued forever.
@@ -297,9 +302,7 @@ index f9e7d769..7a87b76e 100644
 +        // Pass error response through unchanged so chatCore can capture it.
 +        return { response: sent.response, url: sent.url, headers: sent.headers, transformedBody: sent.transformedBody };
 +      }
- 
--    const wrapped = await wrapQoderSSE(response, `${this.provider}/${qoderKey}`, log);
--    return { response: wrapped, url, headers, transformedBody: payload };
++
 +      // Peek the first frame without consuming the stream: a queued model
 +      // announces itself there, and wrapQoderSSE would read the body to
 +      // completion — which loses the ability to hand the same response back
@@ -420,14 +423,26 @@ index f9e7d769..7a87b76e 100644
 +          // No usable status endpoint — keep the old timed-replay behaviour.
 +          statusPollsEnabled = false;
 +        } else if (polled.info.isQueued === false) {
-+          // Model is ready; replay immediately with a fresh signature.
-+          log?.info?.(
-+            "QODER",
-+            `model "${qoderKey}" ready (queueType=${polled.info.queueType || "?"}); replaying`,
-+          );
-+          delayMs = 0;
++          // The status endpoint says ready, but it has been observed saying that
++          // while the inference call is still refused. Replay once, and if that
++          // is refused too, stop trusting the endpoint and fall back to timed
++          // replays — otherwise we spin on a hint that will never be true.
++          if (readyReplayUsed) {
++            statusPollsEnabled = false;
++            log?.info?.(
++              "QODER",
++              `queue status claims ready but "${qoderKey}" is still refused; falling back to timed replays`,
++            );
++          } else {
++            readyReplayUsed = true;
++            log?.info?.(
++              "QODER",
++              `model "${qoderKey}" reported ready (queueType=${polled.info.queueType || "?"}); replaying`,
++            );
++            delayMs = 0;
++          }
 +        } else {
-+          delayMs = computeQoderQueueDelayMs(polled.info);
++          delayMs = computeQoderQueueDelayMs(polled.info, { fromStatus: true });
 +          log?.info?.(
 +            "QODER",
 +            `model "${qoderKey}" still queued (queueType=${polled.info.queueType || "?"}, ` +
@@ -644,10 +659,10 @@ index d5d59af7..e84bd3a2 100644
   *
 diff --git a/open-sse/shared/qoder/queue.js b/open-sse/shared/qoder/queue.js
 new file mode 100644
-index 00000000..b91159a4
+index 00000000..f13f3da0
 --- /dev/null
 +++ b/open-sse/shared/qoder/queue.js
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,224 @@
 +/**
 + * Qoder model-queue handling, reverse-engineered from qodercli 1.1.41.
 + *
@@ -678,10 +693,16 @@ index 00000000..b91159a4
 +// client request. The queue clears in ~30s windows, so 3 minutes covers several
 +// of them and still returns a retryable error instead of hanging. Raise it with
 +// QODER_MODEL_QUEUE_MAX_WAIT_MS when the caller can afford to wait.
-+const DEFAULT_MAX_WAIT_MS = 180_000;
++const DEFAULT_MAX_WAIT_MS = 600_000;
 +const DEFAULT_RETRY_MS = 30_000;
-+const MIN_RETRY_MS = 500;
-+const MAX_RETRY_MS = 30_000;
++// A sub-second floor came from qodercli, but Qoder's queue now answers
++// retryAfterSeconds:2 while still refusing the request. Replaying that fast
++// makes the throttle worse, so the floor is a full retry interval.
++const MIN_RETRY_MS = 15_000;
++const MAX_RETRY_MS = 60_000;
++// The queue-status endpoint can report isQueued:false while the inference call
++// is still refused, so its hint is not trusted below the default interval.
++const STATUS_HINT_FLOOR_MS = 30_000;
 +
 +const NESTED_KEYS = ["error", "data", "body", "message", "cause", "result", "payload"];
 +
@@ -807,12 +828,23 @@ index 00000000..b91159a4
 +}
 +
 +/**
-+ * Delay before the next attempt, honouring the server's own hint.
-+ * qodercli clamps retryAfterSeconds to 500ms..30s.
++ * Delay before the next attempt.
++ *
++ * Two sources feed this and they are not equally trustworthy:
++ *
++ * - the **inference refusal** carries waitTime/retryAfterSeconds for the queue
++ *   the request actually sits in, so its hint is honoured;
++ * - the **queue-status endpoint** has been observed answering
++ *   `isQueued:false, retryAfterSeconds:2` while the inference call is still
++ *   refused. Replaying every 2s on that hint makes the throttle worse, so a
++ *   status-derived delay never drops below STATUS_HINT_FLOOR_MS.
++ *
++ * Both are clamped into MIN_RETRY_MS..MAX_RETRY_MS.
 + */
-+export function computeQoderQueueDelayMs(info) {
++export function computeQoderQueueDelayMs(info, { fromStatus = false } = {}) {
 +  const hint = toNumber(info?.retryAfterSeconds) ?? toNumber(info?.waitTime);
-+  const ms = hint === undefined ? DEFAULT_RETRY_MS : hint * 1000;
++  let ms = hint === undefined ? DEFAULT_RETRY_MS : hint * 1000;
++  if (fromStatus) ms = Math.max(ms, STATUS_HINT_FLOOR_MS);
 +  return Math.min(MAX_RETRY_MS, Math.max(MIN_RETRY_MS, ms));
 +}
 +
@@ -1081,10 +1113,10 @@ index 00000000..7a823087
 +});
 diff --git a/tests/unit/qoder-queue.test.js b/tests/unit/qoder-queue.test.js
 new file mode 100644
-index 00000000..719dc09e
+index 00000000..c25926ae
 --- /dev/null
 +++ b/tests/unit/qoder-queue.test.js
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,222 @@
 +/**
 + * Unit tests for the Qoder model-queue helpers.
 + *
@@ -1194,23 +1226,37 @@ index 00000000..719dc09e
 +});
 +
 +describe("computeQoderQueueDelayMs", () => {
-+  it("honours retryAfterSeconds", () => {
++  it("honours retryAfterSeconds from the inference refusal", () => {
 +    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 30 })).toBe(30_000);
-+    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 12 })).toBe(12_000);
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 20 })).toBe(20_000);
 +  });
 +
 +  it("falls back to waitTime when retryAfterSeconds is absent", () => {
-+    expect(computeQoderQueueDelayMs({ waitTime: 17 })).toBe(17_000);
++    expect(computeQoderQueueDelayMs({ waitTime: 25 })).toBe(25_000);
 +  });
 +
-+  it("clamps to the 500ms..30s window", () => {
-+    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 0 })).toBe(500);
-+    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 600 })).toBe(30_000);
++  it("never replays faster than 15s, even on a tiny hint", () => {
++    // Qoder answers retryAfterSeconds:2 while still refusing; replaying that
++    // fast makes the throttle worse.
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 0 })).toBe(15_000);
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 2 })).toBe(15_000);
++  });
++
++  it("clamps the upper bound to 60s", () => {
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 600 })).toBe(60_000);
 +  });
 +
 +  it("uses a 30s default when no hint is present", () => {
 +    expect(computeQoderQueueDelayMs(null)).toBe(30_000);
 +    expect(computeQoderQueueDelayMs({})).toBe(30_000);
++  });
++
++  it("raises a status-derived hint to 30s", () => {
++    // The queue-status endpoint has reported isQueued:false with
++    // retryAfterSeconds:2 while the inference call was still refused, so its
++    // hint is not trusted below one full interval.
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 2 }, { fromStatus: true })).toBe(30_000);
++    expect(computeQoderQueueDelayMs({ retryAfterSeconds: 45 }, { fromStatus: true })).toBe(45_000);
 +  });
 +});
 +
@@ -1270,10 +1316,10 @@ index 00000000..719dc09e
 +});
 +
 +describe("qoderQueueMaxWaitMs", () => {
-+  it("defaults to 3 minutes", () => {
++  it("defaults to 10 minutes", () => {
 +    const prev = process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
 +    delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
-+    expect(qoderQueueMaxWaitMs()).toBe(180_000);
++    expect(qoderQueueMaxWaitMs()).toBe(600_000);
 +    if (prev !== undefined) process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = prev;
 +  });
 +
@@ -1288,7 +1334,7 @@ index 00000000..719dc09e
 +  it("ignores a nonsensical override", () => {
 +    const prev = process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
 +    process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = "not-a-number";
-+    expect(qoderQueueMaxWaitMs()).toBe(180_000);
++    expect(qoderQueueMaxWaitMs()).toBe(600_000);
 +    if (prev === undefined) delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
 +    else process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = prev;
 +  });

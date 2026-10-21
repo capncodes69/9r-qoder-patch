@@ -118,9 +118,25 @@ replay     -> 200, real completion
 
 Same request, same account: **403 in 1.8s before, 200 with `"PONG"` in 34s after.**
 
-Budget defaults to 3 minutes, raisable with `QODER_MODEL_QUEUE_MAX_WAIT_MS`. When
+Budget defaults to 10 minutes, raisable with `QODER_MODEL_QUEUE_MAX_WAIT_MS`. When
 it runs out you get a retryable `503` (`code: qoder_model_queued`) rather than a
 false quota error, so account fallback still rotates.
+
+**Qoder's queue-status endpoint can lie.** Since v1.35.0 it reports
+`isQueued:false, serviceAvailable:true, retryAfterSeconds:2` while the inference
+call is still refused. Replaying on that hint makes the throttle worse, so the
+patch:
+
+- never replays faster than 15s, whatever the server suggests;
+- raises a status-derived hint to at least 30s — the inference refusal is the
+  authoritative one;
+- uses the "status says ready" fast path once, then ignores the endpoint if the
+  replay is refused again.
+
+The queue is also a throttle on the **account**, not on the model: all models and
+all chat hosts refuse together, and refused requests are not billed. If your
+account is throttled, no amount of replaying clears it — the patch waits it out
+within the budget and then reports a retryable error.
 
 ### 2. Sonus and Cantus are routable
 
